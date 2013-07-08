@@ -27,12 +27,18 @@ def create_index(args):
     """Create index"""
     config = read_config(args.config)
     workspace = cubes.create_workspace_from_config(config)
-    cube = workspace.model.cube(args.cube)
-    browser = workspace.browser(cube)
+    if args.cube == 'all':
+        cubes_to_index = workspace.model.cubes.values()
+    else:
+        cubes_to_index = [ workspace.model.cube(args.cube) ]
 
     locales = workspace.locales
     if not locales:
         locales = ["default"]
+
+    since = args.since
+    if since is not None:
+        since = int(since)
 
     if args.engine == 'sphinx':
         iclass = cubes_search.sphinx.XMLSphinxIndexer
@@ -41,9 +47,16 @@ def create_index(args):
     else:
         raise Exception('Unknown search engine %s' % args.engine)
 
-
-    indexer = iclass(browser, config)
-    indexer.index(locales, labels_only=args.labels_only, init=args.init)
+    for cube in cubes_to_index:
+        browser = workspace.browser(cube)
+        indexer = iclass(browser, config)
+        print "Indexing %s..." % cube
+        try:
+            indexer.index(locales, labels_only=args.labels_only, init=args.init, since=since)
+            print "DONE indexing %s." % cube
+        except:
+            print "ERROR indexing %s" % cube
+            print sys.exc_info()
 
 ################################################################################
 # Main code
@@ -54,6 +67,7 @@ parser.add_argument('config', help='server confuguration .ini file')
 parser.add_argument('cube', help='cube name')
 parser.set_defaults(func=create_index)
 parser.add_argument('--engine')
+parser.add_argument('--since', help="number of days in past to pull dimension values for when indexing")
 parser.add_argument('--init', action='store_true', help="initialize (create) the index")
 parser.add_argument('--labels-only', action='store_true')
 

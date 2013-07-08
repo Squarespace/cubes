@@ -532,6 +532,8 @@ class CubesController(ApplicationController):
         return self.json_response({'status': 'building'})
 
 
+_searchers = {}
+
 class SearchController(ApplicationController):
     """docstring for SearchController
 
@@ -562,6 +564,9 @@ class SearchController(ApplicationController):
                                                   locale=self.locale)
 
     def create_searcher(self):
+        self.searcher = _searchers.get(self.browser.cube.name)
+        if self.searcher is not None:
+            return
         if self.config.has_section("search"):
             self.options = dict(self.config.items("search"))
             self.engine_name = self.config.get("search", "engine")
@@ -574,6 +579,7 @@ class SearchController(ApplicationController):
                                             browser=self.browser,
                                             locales=self.locales,
                                             **options)
+        _searchers[self.browser.cube.name] = self.searcher
 
     def search(self, cube):
         self.create_browser(cube)
@@ -584,6 +590,8 @@ class SearchController(ApplicationController):
         if not dimension:
             raise RequestError("No dimension provided for search")
 
+        level = self.args.get("level")
+
         query = self.args.get("q")
         if not query:
             query = self.args.get("query")
@@ -591,14 +599,18 @@ class SearchController(ApplicationController):
         if not query:
             raise RequestError("No search query provided")
 
+        path_prefix = self.args.get('path_prefix')
+
         locale = self.locale
         if not locale and self.locales:
             locale = self.locales[0]
 
-        self.logger.debug("searching for '%s' in %s, locale %s" % (query,
-            dimension, locale))
+        ngrams = ( not not self.args.get("ngrams", False) )
 
-        search_result = self.searcher.search(query, dimension, locale=locale)
+        self.logger.debug("searching for '%s' in %s, locale %s, ngrams %s" % (query,
+            dimension, locale, ngrams))
+
+        search_result = self.searcher.search(query, dimension, level=level, path_prefix=path_prefix, locale=locale, ngrams=ngrams)
 
         result = {
             "matches": search_result.dimension_matches(dimension),

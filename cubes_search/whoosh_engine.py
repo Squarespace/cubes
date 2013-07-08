@@ -2,12 +2,14 @@ import os
 import shutil
 import cubes
 from cubes.common import to_unicode_string
+from functools import partial
+from datetime import datetime, timedelta
 
 try:
     from whoosh import index
-    from whoosh.fields import Schema, TEXT, KEYWORD, ID, STORED, NUMERIC
+    from whoosh.fields import Schema, TEXT, KEYWORD, ID, STORED, NUMERIC, NGRAMWORDS, NGRAM
     from whoosh.qparser import QueryParser
-    from whoosh.query import Term
+    from whoosh.query import Term, Prefix
     from whoosh.sorting import FieldFacet
 
 except ImportError:
@@ -50,7 +52,7 @@ class WhooshIndexer(object):
         # all dimension values, which is not currently implemented nor in the
         # API definition
 
-    def index(self, locales, init=False, **options):
+    def index(self, locales, init=False, since=None, **options):
         """Create index records for all dimensions in the cube"""
         # FIXME: this works only for one locale - specified in browser
 
@@ -72,11 +74,12 @@ class WhooshIndexer(object):
                 self.index_dimension(dimension, dim_tag,
                                      locale=locale,
                                      locale_tag=locale_tag,
+                                     since=since,
                                      **options)
         self.writer.commit()
 
     def index_dimension(self, dimension, dimension_tag, locale,
-                        locale_tag, **options):
+                        locale_tag, since=None, **options):
         """Create dimension index records.
 
         If `Attribute.info` has key `no_search` set to `True`, then the field
@@ -90,6 +93,22 @@ class WhooshIndexer(object):
         # Switch browser locale
         self.browser.set_locale(locale)
         cell = cubes.Cell(self.cube)
+
+        # if since, compute a timedelta in days for the cube's first
+        # occurring date/time dimension.
+        if since is not None:
+            date_dim = None
+            for d in self.cube.dimensions:
+                if len([l for l in d.levels if l.name == 'year']):
+                    date_dim = d
+                    break
+            if not date_dim:
+                print "Cannot locate date dimension for cube %s, ignoring since value of %s" % (self.cube, since)
+            else:
+                dt = datetime.now() - timedelta(days=since)
+                cut = cubes.RangeCut(date_dim, map(partial(getattr, dt), ('year', 'month', 'day')), None, None, False)
+                print "Since arg of %s results in index dimension cut of %s" % (since, cut)
+                cell = cubes.Cell(self.cube, [cut])
 
         for depth_m1, level in enumerate(hierarchy.levels):
             depth = depth_m1 + 1
@@ -115,7 +134,9 @@ class WhooshIndexer(object):
 
                 for attr in attributes:
                     ref = to_unicode_string(attr.ref())
-                    self.writer.add_document(
+                    doc_id = u":".join( map(to_unicode_string, (dimension.name, level.name, attr.name, locale, record[ref])) )
+                    self.writer.update_document(
+                        document_id=doc_id,
                         locale=to_unicode_string(locale),
                         dimension=dimension.name,
                         level=level.name,
@@ -124,7 +145,8 @@ class WhooshIndexer(object):
                         level_key=record[level_key],
                         level_label=record[level_label],
                         attribute=attr.name,
-                        value=to_unicode_string(record[ref])
+                        value=to_unicode_string(record[ref]),
+                        ngram_value=to_unicode_string(record[ref])
                     )
 
     def initialize(self):
@@ -137,15 +159,17 @@ class WhooshIndexer(object):
             os.mkdir(self.path)
 
         schema = Schema(
+                    document_id=ID(stored=True, unique=True),
                     locale=TEXT(stored=True),
                     dimension=TEXT(stored=True),
-                    level=STORED,
+                    level=TEXT(stored=True),
                     depth=STORED,
-                    path=STORED,
+                    path=ID(stored=True),
                     level_key=STORED,
                     level_label=STORED,
                     attribute=STORED,
-                    value=TEXT(stored=True)
+                    value=TEXT(stored=True),
+                    ngram_value=NGRAMWORDS(2,6, at='start')
                 )
 
         ix = index.create_in(self.path, schema)
@@ -164,29 +188,39 @@ class WhooshSearcher(object):
         self.options = options
 
         self.index = index.open_dir(self.path)
-        self.searcher = self.index.searcher()
         self.default_limit = default_limit or 20
         self.locales = locales or []
 
-    def search(self, query, dimension=None, locale=None, limit=None):
+    def search(self, query, dimension=None, level=None, path_prefix=None, locale=None, limit=None, ngrams=False):
         """Peform search using Whoosh. If `dimension` is set then only the one
         dimension will be searched."""
-        print "SEARCH IN %s QUERY '%s' LOCALE:%s" % (str(dimension), query, locale)
+        print "SEARCH IN %s QUERY '%s' LOCALE:%s, ngrams:%s" % (str(dimension), query, locale, ngrams)
 
-        qp = QueryParser("value", schema=self.index.schema)
+        facet = FieldFacet("ngram_value") if ngrams else FieldFacet("value")
+
+        qp = QueryParser(facet.default_name(), schema=self.index.schema)
 
         q = qp.parse(query)
         if dimension:
             q = q & Term('dimension', str(dimension))
 
+        if level:
+            q = q & Term('level', str(level))
+
+        if path_prefix:
+            q = q & Prefix('path', str(path_prefix))
+
         if locale:
             q = q & Term('locale', str(locale))
         # FIXME: set locale filter
 
-        facet = FieldFacet("value")
         limit = limit or self.default_limit
         print "QUERY: %s" % q
-        results = self.searcher.search(q, limit=limit, sortedby=facet)
+        import time
+        t = time.time()
+        with self.index.searcher() as searcher:
+            results = map(dict, searcher.search(q, limit=limit, sortedby=facet))
+        print "Time to search: %f sec" % (time.time() - t)
 
         print "FOUND: %s results" % len(results)
         return WhooshSearchResult(self.browser, results)
